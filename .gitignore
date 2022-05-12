@@ -1,0 +1,8 @@
+.vscode/*
+imagenet/*
+runs/*
+
+*.ipynb
+*.JPEG
+*.txt
+*.pdf
