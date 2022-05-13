@@ -1,8 +1,10 @@
 .vscode/*
 imagenet/*
 runs/*
+__pycache__/*
 
 *.ipynb
 *.JPEG
 *.txt
 *.pdf
+*.tar
