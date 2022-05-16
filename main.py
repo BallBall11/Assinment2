@@ -8,6 +8,7 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -19,6 +20,15 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torchvision
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import numpy as np
+
+from tinyImageNet import TinyImageNet
+
+writer = SummaryWriter('runs/imagenet_12')
+f = open('curve.txt','w')
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -32,7 +42,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -79,6 +89,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 best_acc1 = 0
 
 
+
 def main():
     args = parser.parse_args()
 
@@ -115,7 +126,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1
+    global best_acc1, writer
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -136,7 +147,7 @@ def main_worker(gpu, ngpus_per_node, args):
         model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+        model = models.__dict__[args.arch](num_classes=200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -205,19 +216,41 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+
+    # traindir = os.path.join(args.data, 'train')
+    # valdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+    transform = transforms.Compose([
+                    transforms.RandomResizedCrop(64),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+                ])
+
+    transform_val = transforms.Compose([
             transforms.ToTensor(),
             normalize,
-        ]))
+        ])
+
+    # transform = None
+
+    # train_dataset = datasets.ImageFolder(
+    #     traindir,
+    #     transforms.Compose([
+    #         transforms.RandomResizedCrop(224),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         normalize,
+    #     ]))
+
+    train_dataset = TinyImageNet(args.data, train=True, transform=transform)
+    val_dataset = TinyImageNet(args.data, train=False, transform=transform_val)
+    
+    tags = val_dataset.class_to_label
+    classes = val_dataset.tgt_idx_to_class
+    # print(classes)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -229,18 +262,26 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
+        # datasets.ImageFolder(valdir, transforms.Compose([
+        #     transforms.Resize(256),
+        #     transforms.CenterCrop(224),
+        #     transforms.ToTensor(),
+        #     normalize,
+        # ])),
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model,0, criterion, args, classes,tags)
         return
+
+    images, labels = next(iter(train_loader))
+
+    grid = torchvision.utils.make_grid(images)
+    writer.add_image('images', grid, 0)
+    writer.add_graph(model, images)
+    writer.flush()
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -250,7 +291,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, epoch, criterion, args,classes, tags)
         
         scheduler.step()
 
@@ -269,9 +310,23 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best)
+            if epoch % 10 == 9:
+                save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+                'scheduler' : scheduler.state_dict()
+            }, False, 'checkpoint_{:d}.pth.tar'.format(epoch+1))
+
+    writer.flush()
+
+    
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
+    global writer
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -286,6 +341,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
+
+    # running_loss = 0.0
+
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -316,9 +374,26 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+            writer.add_scalar('Train/Loss',losses.avg, epoch * len(train_loader) + i)
+            writer.add_scalar('Train/Accuracy@5',top5.avg, epoch * len(train_loader) + i)
+        
+        # running_loss += loss.item()
+        
+        # if i % 100 == 99:    # every 1000 mini-batches...
 
+        #     # ...log the running loss
+        #     writer.add_scalar('training loss',
+        #                     running_loss / 100,
+        #                     epoch * len(train_loader) + i)
+        #     print('i=',i,'total=',epoch * len(train_loader) + i,'loss=',running_loss/100)
+        #     f.write('{:d}\t{:.5f}\n'.format(epoch * len(train_loader) + i, running_loss/100))
+        #     # ...log a Matplotlib Figure showing the model's predictions on a
+        #     # random mini-batch
+        #     running_loss = 0.0
+    # writer.flush()
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, epoch, criterion, args, classes, tags):
+    global writer
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
@@ -327,7 +402,7 @@ def validate(val_loader, model, criterion, args):
         len(val_loader),
         [batch_time, losses, top1, top5],
         prefix='Test: ')
-
+    
     # switch to evaluate mode
     model.eval()
 
@@ -356,10 +431,63 @@ def validate(val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
+      
         progress.display_summary()
+        writer.add_scalar('Test/Loss',losses.avg, epoch)
+        writer.add_scalar('Test/Accuracy@5',top5.avg, epoch)
+
+        writer.add_figure('predictions',
+                            plot_classes_preds(model, images, target, classes, tags))
 
     return top1.avg
 
+
+def images_to_probs(net, images):
+    '''
+    Generates predictions and corresponding probabilities from a trained
+    network and a list of images
+    '''
+    output = net(images)
+    # convert output probabilities to predicted class
+    _, preds_tensor = torch.max(output, 1)
+    preds = np.squeeze(preds_tensor.cpu().numpy())
+    return preds, [F.softmax(el, dim=0)[i].item() for i, el in zip(preds, output)]
+
+
+def plot_classes_preds(net, images, labels, classes, tags):
+    '''
+    Generates matplotlib Figure using a trained network, along with images
+    and labels from a batch, that shows the network's top prediction along
+    with its probability, alongside the actual label, coloring this
+    information based on whether the prediction was correct or not.
+    Uses the "images_to_probs" function.
+    '''
+    preds, probs = images_to_probs(net, images)
+    # plot the images in the batch, along with predicted and true labels
+    fig = plt.figure(figsize=(12, 48))
+    for idx in np.arange(16):
+        ax = fig.add_subplot(4, 4, idx+1, xticks=[], yticks=[])
+        # print(labels[idx])
+        matplotlib_imshow(images[idx], one_channel=False)
+        ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
+            tags[classes[preds[idx]]],
+            probs[idx] * 100.0,
+            tags[classes[labels[idx].item()]]),
+                    color=("green" if preds[idx]==labels[idx].item() else "red"))
+    
+    plt.show()
+
+    return fig
+
+def matplotlib_imshow(img, one_channel=False):
+    if one_channel:
+        img = img.mean(dim=0)
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.cpu().numpy()
+    if one_channel:
+        plt.imshow(npimg, cmap="Greys")
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
@@ -452,3 +580,5 @@ def accuracy(output, target, topk=(1,)):
 
 if __name__ == '__main__':
     main()
+    writer.close()
+    f.close()

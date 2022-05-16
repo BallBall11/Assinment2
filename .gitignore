@@ -5,6 +5,9 @@ __pycache__/*
 
 *.ipynb
 *.JPEG
-*.txt
 *.pdf
+*.md
 *.tar
+*.png
+*.svg
+*.zip
